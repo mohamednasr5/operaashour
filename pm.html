@@ -697,7 +697,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/9.22.0/firebase-app.js";
-        import { getDatabase, ref, push, onValue, update, set, get } from "https://www.gstatic.com/firebasejs/9.22.0/firebase-database.js";
+        import { getDatabase, ref, push, onValue, update, set, get, off } from "https://www.gstatic.com/firebasejs/9.22.0/firebase-database.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyDJ_dnEZP62J871KLAg88_quQdUt01004o",
@@ -709,41 +709,20 @@
             measurementId: "G-W46366S9Z2"
         };
 
+        // Initialize Firebase
         const app = initializeApp(firebaseConfig);
         const db = getDatabase(app);
 
-        // --- AUDIO & NOTIFICATION LOGIC ---
-        const msgSound = document.getElementById('msg-sound');
-        const hourSound = document.getElementById('hour-sound');
-
-        // Request Permission
-        function requestNotifyPermission() {
-            if ("Notification" in window && Notification.permission !== "granted") {
-                Notification.requestPermission();
-            }
-        }
-
-        function sendBrowserNotification(title, body) {
-            if ("Notification" in window && Notification.permission === "granted") {
-                new Notification(title, { body: body, icon: 'https://raw.githubusercontent.com/mohamednasr5/opera/main/01.png' });
-            }
-        }
-
-        function playSound(type) {
-            if(type === 'msg') {
-                msgSound.currentTime = 0;
-                msgSound.play().catch(e => console.log("Audio play failed", e));
-            } else if (type === 'hour') {
-                hourSound.currentTime = 0;
-                hourSound.play().catch(e => console.log("Audio play failed", e));
-            }
-        }
-
-        // Global State
+        // --- GLOBAL STATE & LISTENERS ---
         let currentChildId = null;
         let currentChildLink = "";
         let parentInterval = null;
         let adminTimerInterval = null;
+        let adminChildrenListener = null;
+        let adminChatListener = null;
+        let parentMainListener = null;
+        let parentChatListener = null;
+        
         let allChildrenData = {};
         let currentChatId = null; 
         let lastMessageCounts = {}; 
@@ -780,16 +759,14 @@
             });
         }
 
-        // --- ROUTING & LOGIN ---
-        function handleEnter(e) { if(e.key === 'Enter') checkLogin(); }
-        window.handleEnter = handleEnter;
+        // --- ROUTING & LOGIN (Attached to window for onclick) ---
+        window.handleEnter = (e) => { if(e.key === 'Enter') window.checkLogin(); };
 
         window.checkLogin = () => {
             requestNotifyPermission(); 
             const pass = document.getElementById('login-pass').value;
             if(pass === '0100') {
                 loginScreen.classList.add('hidden');
-                // TWEAK: Hide stats button for regular admin
                 document.getElementById('nav-stats-btn').classList.add('hidden');
                 document.getElementById('nav-logout-btn').classList.remove('hidden');
                 document.getElementById('admin-controls').style.display = 'flex'; 
@@ -807,6 +784,13 @@
         };
 
         window.logout = () => {
+            // Detach listeners
+            if(adminChildrenListener) off(ref(db, 'children'));
+            if(adminTimerInterval) clearInterval(adminTimerInterval);
+            if(parentMainListener) off(ref(db, `children/${childIdParam}`));
+            if(parentChatListener) off(ref(db, `children/${childIdParam}/messages`));
+            if(parentInterval) clearInterval(parentInterval);
+            
             location.reload();
         };
 
@@ -835,100 +819,105 @@
             adminView.classList.remove('hidden');
             document.getElementById('header-subtitle').innerText = "لوحة الإدارة";
             
-            onValue(ref(db, 'children'), (snapshot) => {
-                const data = snapshot.val();
-                allChildrenData = data || {};
-                listActive.innerHTML = '';
-                listHistory.innerHTML = '';
-                if (!data) listActive.innerHTML = '<p style="text-align:center; color:#999;">لا يوجد أطفال</p>';
+            // Attach Listener for Children
+            const childrenRef = ref(db, 'children');
+            onValue(childrenRef, (snapshot) => {
+                try {
+                    const data = snapshot.val();
+                    allChildrenData = data || {};
+                    listActive.innerHTML = '';
+                    listHistory.innerHTML = '';
+                    if (!data) listActive.innerHTML = '<p style="text-align:center; color:#999;">لا يوجد أطفال</p>';
 
-                Object.keys(data).forEach(key => {
-                    const child = data[key];
-                    const link = `${window.location.origin}${window.location.pathname}?mode=parent&id=${key}`;
-                    let billableTime = 0;
+                    Object.keys(data).forEach(key => {
+                        const child = data[key];
+                        const link = `${window.location.origin}${window.location.pathname}?mode=parent&id=${key}`;
+                        let billableTime = 0;
 
-                    if (child.status === 'in') {
-                        billableTime = Date.now() - child.entryTime - (child.totalPausedTime || 0);
-                        const div = document.createElement('div');
-                        div.className = 'kid-card in-status';
-                        div.setAttribute('data-name', child.name);
-                        div.setAttribute('data-phone', child.phone);
-                        div.setAttribute('data-id', child.childId || '');
+                        if (child.status === 'in') {
+                            billableTime = Date.now() - child.entryTime - (child.totalPausedTime || 0);
+                            const div = document.createElement('div');
+                            div.className = 'kid-card in-status';
+                            div.setAttribute('data-name', child.name);
+                            div.setAttribute('data-phone', child.phone);
+                            div.setAttribute('data-id', child.childId || '');
 
-                        // --- MESSAGE NOTIFICATION LOGIC (ADMIN) ---
-                        const msgs = child.messages ? Object.values(child.messages) : [];
-                        const msgCount = msgs.length;
-                        const lastCount = lastMessageCounts[key] || 0;
-                        
-                        if (msgCount > lastCount) {
-                             const lastMsg = msgs[msgs.length - 1];
-                             if (lastMsg.sender === 'parent') {
-                                 playSound('msg');
-                                 sendBrowserNotification(`رسالة جديدة من: ${child.name}`, lastMsg.text);
-                                 showToast(`📩 رسالة من ${child.name}`);
-                             }
+                            const msgs = child.messages ? Object.values(child.messages) : [];
+                            const msgCount = msgs.length;
+                            const lastCount = lastMessageCounts[key] || 0;
+                            
+                            if (msgCount > lastCount) {
+                                 const lastMsg = msgs[msgs.length - 1];
+                                 if (lastMsg.sender === 'parent') {
+                                     playSound('msg');
+                                     sendBrowserNotification(`رسالة جديدة من: ${child.name}`, lastMsg.text);
+                                     showToast(`📩 رسالة من ${child.name}`);
+                                 }
+                            }
+                            lastMessageCounts[key] = msgCount;
+                            const badgeHtml = msgCount > 0 ? `<span class="notification-badge">${msgCount}</span>` : '';
+
+                            div.innerHTML = `
+                                <div class="kid-info">
+                                    <h3>${child.name} <span class="kid-id-badge">#${child.childId || '0000'}</span></h3>
+                                    <div class="kid-meta">
+                                        <span class="kid-tag">📱 ${child.phone}</span>
+                                        <span class="kid-tag">🍽️ ${child.snack}</span>
+                                    </div>
+                                    <div class="timer-display">⏰ <span class="time-text" data-name="${child.name}" data-billable="${billableTime}" data-last-hour="0">${formatDuration(billableTime)}</span></div>
+                                </div>
+                                <div class="controls">
+                                    <button class="btn btn-whatsapp" onclick="window.sendToWhatsApp('${child.phone}', '${encodeURIComponent(link)}')"><i class="fab fa-whatsapp"></i></button>
+                                    <button class="btn btn-warning" onclick="window.pauseChild('${key}')" title="خروج مؤقت"><i class="fas fa-pause"></i></button>
+                                    <button class="btn btn-primary" style="position:relative;" onclick="window.openAdminChat('${key}', '${child.name}')" title="محادثة">
+                                        <i class="fas fa-comments"></i> ${badgeHtml}
+                                    </button>
+                                    <button class="btn btn-danger" onclick="window.prepareCheckout('${key}')">خروج</button>
+                                </div>
+                            `;
+                            listActive.appendChild(div);
+                        } else if (child.status === 'paused') {
+                            billableTime = child.pauseStartTime - child.entryTime - (child.totalPausedTime || 0);
+                            const div = document.createElement('div');
+                            div.className = 'kid-card paused-status';
+                            div.setAttribute('data-name', child.name);
+                            div.setAttribute('data-phone', child.phone);
+                            div.setAttribute('data-id', child.childId || '');
+                            
+                            div.innerHTML = `
+                                <div class="kid-info">
+                                    <h3>${child.name} <span class="kid-id-badge">#${child.childId || '0000'}</span></h3>
+                                    <div class="kid-meta"><span class="status-badge-paused">خروج مؤقت</span></div>
+                                    <div class="timer-display timer-paused">⏰ ${formatDuration(billableTime)}</div>
+                                </div>
+                                <div class="controls">
+                                    <button class="btn btn-success" style="color:white; background:var(--success);" onclick="window.resumeChild('${key}')">▶️ استكمال</button>
+                                    <button class="btn btn-danger" onclick="window.prepareCheckout('${key}')">خروج نهائي</button>
+                                </div>
+                            `;
+                            listActive.appendChild(div);
+                        } else {
+                            const diff = child.exitTime - child.entryTime - (child.totalPausedTime || 0);
+                            const div = document.createElement('div');
+                            div.className = 'kid-card out-status';
+                            div.innerHTML = `
+                                <div class="kid-info">
+                                    <h3>${child.name} <small style="text-decoration:line-through; color:#999;">(خارج)</small> <span class="kid-id-badge">#${child.childId || '0000'}</span></h3>
+                                    <div class="kid-meta">
+                                        <span class="kid-tag">⏳ ${formatDuration(diff)}</span>
+                                        <span class="kid-tag">📅 ${new Date(child.exitTime).toLocaleDateString('ar-EG')}</span>
+                                    </div>
+                                    <div class="price-tag" style="font-weight:bold; color:var(--primary);">💰 ${child.totalCost} ج.م</div>
+                                </div>
+                            `;
+                            listHistory.appendChild(div);
                         }
-                        lastMessageCounts[key] = msgCount;
-                        const badgeHtml = msgCount > 0 ? `<span class="notification-badge">${msgCount}</span>` : '';
-
-                        div.innerHTML = `
-                            <div class="kid-info">
-                                <h3>${child.name} <span class="kid-id-badge">#${child.childId || '0000'}</span></h3>
-                                <div class="kid-meta">
-                                    <span class="kid-tag">📱 ${child.phone}</span>
-                                    <span class="kid-tag">🍽️ ${child.snack}</span>
-                                </div>
-                                <div class="timer-display">⏰ <span class="time-text" data-name="${child.name}" data-billable="${billableTime}" data-last-hour="0">${formatDuration(billableTime)}</span></div>
-                            </div>
-                            <div class="controls">
-                                <button class="btn btn-whatsapp" onclick="sendToWhatsApp('${child.phone}', '${encodeURIComponent(link)}')"><i class="fab fa-whatsapp"></i></button>
-                                <button class="btn btn-warning" onclick="pauseChild('${key}')" title="خروج مؤقت"><i class="fas fa-pause"></i></button>
-                                <button class="btn btn-primary" style="position:relative;" onclick="openAdminChat('${key}', '${child.name}')" title="محادثة">
-                                    <i class="fas fa-comments"></i> ${badgeHtml}
-                                </button>
-                                <button class="btn btn-danger" onclick="prepareCheckout('${key}')">خروج</button>
-                            </div>
-                        `;
-                        listActive.appendChild(div);
-                    } else if (child.status === 'paused') {
-                        billableTime = child.pauseStartTime - child.entryTime - (child.totalPausedTime || 0);
-                        const div = document.createElement('div');
-                        div.className = 'kid-card paused-status';
-                        div.setAttribute('data-name', child.name);
-                        div.setAttribute('data-phone', child.phone);
-                        div.setAttribute('data-id', child.childId || '');
-                        
-                        div.innerHTML = `
-                            <div class="kid-info">
-                                <h3>${child.name} <span class="kid-id-badge">#${child.childId || '0000'}</span></h3>
-                                <div class="kid-meta"><span class="status-badge-paused">خروج مؤقت</span></div>
-                                <div class="timer-display timer-paused">⏰ ${formatDuration(billableTime)}</div>
-                            </div>
-                            <div class="controls">
-                                <button class="btn btn-success" style="color:white; background:var(--success);" onclick="resumeChild('${key}')">▶️ استكمال</button>
-                                <button class="btn btn-danger" onclick="prepareCheckout('${key}')">خروج نهائي</button>
-                            </div>
-                        `;
-                        listActive.appendChild(div);
-                    } else {
-                        const diff = child.exitTime - child.entryTime - (child.totalPausedTime || 0);
-                        const div = document.createElement('div');
-                        div.className = 'kid-card out-status';
-                        div.innerHTML = `
-                            <div class="kid-info">
-                                <h3>${child.name} <small style="text-decoration:line-through; color:#999;">(خارج)</small> <span class="kid-id-badge">#${child.childId || '0000'}</span></h3>
-                                <div class="kid-meta">
-                                    <span class="kid-tag">⏳ ${formatDuration(diff)}</span>
-                                    <span class="kid-tag">📅 ${new Date(child.exitTime).toLocaleDateString('ar-EG')}</span>
-                                </div>
-                                <div class="price-tag" style="font-weight:bold; color:var(--primary);">💰 ${child.totalCost} ج.م</div>
-                            </div>
-                        `;
-                        listHistory.appendChild(div);
-                    }
-                });
-                
-                filterAdminList();
+                    });
+                    
+                    filterAdminList();
+                } catch (err) {
+                    console.error("Admin Data Error:", err);
+                }
             });
 
             if(adminTimerInterval) clearInterval(adminTimerInterval);
@@ -960,6 +949,7 @@
                 const randomId = Math.floor(1000 + Math.random() * 9000).toString();
                 const newRef = push(ref(db, 'children'));
                 const link = `${window.location.origin}${window.location.pathname}?mode=parent&id=${newRef.key}`;
+                
                 set(newRef, {
                     name, phone, snack, entryTime: Date.now(), status:'in', messages:[], totalPausedTime:0,
                     childId: randomId
@@ -973,7 +963,9 @@
                     qrContainer.innerHTML = '';
                     new QRCode(qrContainer, { text: link, width:128, height: 128 });
                     document.getElementById('test-link-btn').href = link;
-                    document.getElementById('wa-btn-new').onclick = () => sendToWhatsApp(phone, encodeURIComponent(link));
+                    document.getElementById('wa-btn-new').onclick = () => window.sendToWhatsApp(phone, encodeURIComponent(link));
+                }).catch(err => {
+                    showToast("حدث خطأ في الاتصال");
                 });
             };
         }
@@ -984,7 +976,13 @@
             document.getElementById('chat-modal-title').innerText = `محادثة مع والد/ة الطفل: ${name}`;
             document.getElementById('admin-chat-modal').style.display = 'flex';
             document.getElementById('admin-chat-input').focus();
+            
+            // Remove old listener if exists
+            if(adminChatListener) off(adminChatListener);
+
             const chatRef = ref(db, `children/${id}/messages`);
+            adminChatListener = chatRef; // Store ref for cleanup
+            
             onValue(chatRef, (snapshot) => {
                 const messages = snapshot.val();
                 const historyEl = document.getElementById('admin-chat-history');
@@ -1141,7 +1139,10 @@
             let prevMsgCount = 0;
             
             // 1. Chat Listener
-            onValue(ref(db, `children/${id}/messages`), (snapshot) => {
+            const chatRef = ref(db, `children/${id}/messages`);
+            parentChatListener = chatRef;
+            
+            onValue(chatRef, (snapshot) => {
                 const messages = snapshot.val();
                 const container = document.getElementById('parent-chat-messages');
                 container.innerHTML = '';
@@ -1179,7 +1180,10 @@
             });
 
             // 2. Main Data Listener
-            onValue(ref(db, `children/${id}`), s => {
+            const mainRef = ref(db, `children/${id}`);
+            parentMainListener = mainRef;
+
+            onValue(mainRef, s => {
                 const c = s.val();
                 if(!c) return;
                 document.getElementById('p-child-id').innerText = '#' + (c.childId || '0000');
@@ -1245,6 +1249,32 @@
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 3000);
         };
+
+        // --- AUDIO & NOTIFICATION LOGIC ---
+        const msgSound = document.getElementById('msg-sound');
+        const hourSound = document.getElementById('hour-sound');
+
+        function requestNotifyPermission() {
+            if ("Notification" in window && Notification.permission !== "granted") {
+                Notification.requestPermission();
+            }
+        }
+
+        function sendBrowserNotification(title, body) {
+            if ("Notification" in window && Notification.permission === "granted") {
+                new Notification(title, { body: body, icon: 'https://raw.githubusercontent.com/mohamednasr5/opera/main/01.png' });
+            }
+        }
+
+        function playSound(type) {
+            if(type === 'msg') {
+                msgSound.currentTime = 0;
+                msgSound.play().catch(e => console.log("Audio play failed", e));
+            } else if (type === 'hour') {
+                hourSound.currentTime = 0;
+                hourSound.play().catch(e => console.log("Audio play failed", e));
+            }
+        }
     </script>
 </body>
-</html>//
+</html>
